@@ -1,0 +1,1289 @@
+from __future__ import annotations
+
+import os
+import warnings
+from collections import OrderedDict
+from typing import Callable, Dict, Literal, Mapping, Any, Optional, Sequence, cast
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import time
+from tensordict.tensordict import TensorDict, TensorDictBase
+from torchrl.data import Binary, Composite, Unbounded
+from torchrl.envs import EnvBase
+
+import active_adaptation
+import active_adaptation.envs.mdp as mdp
+import active_adaptation.utils.symmetry as symmetry_utils
+from termcolor import colored
+from active_adaptation.envs.adapters import SimAdapter, SceneAdapter
+from active_adaptation.utils.profiling import PROFILE_SYNC_TIMERS, ScopedTimer
+from active_adaptation.utils.video_recorder import (
+    VideoRecorder,
+    NullVideoRecorder,
+    IsaacVideoRecorder,
+    RgbArrayVideoRecorder,
+)
+from active_adaptation.envs.utils import GroundQuery
+from active_adaptation.registry import RegistryMixin
+
+if active_adaptation.get_backend() == "isaaclab":
+    import isaacsim.core.utils.torch as torch_utils
+
+
+EMA_DECAY = 0.99
+
+NanGuardMode = Literal["sanitize", "error", "off"]
+_NAN_GUARD_MODES = frozenset({"sanitize", "error", "off"})
+NAN_GUARD_ENV = "AA_NAN_GUARD"
+
+
+class NonFiniteTransitionError(RuntimeError):
+    """Raised when ``nan_guard=error`` and a transition contains non-finite values."""
+
+    def __init__(self, *, env_ids: list[int], keys: list[Any]) -> None:
+        self.env_ids = env_ids
+        self.keys = keys
+        key_str = ", ".join(_format_tensordict_key(key) for key in keys)
+        super().__init__(
+            f"Non-finite values in transition for env_ids={env_ids} "
+            f"(keys: {key_str}). Set task.nan_guard=sanitize to isolate bad envs, "
+            f"or fix the offending MDP term / simulation."
+        )
+
+
+def _format_tensordict_key(key: Any) -> str:
+    if isinstance(key, tuple):
+        return "/".join(str(part) for part in key)
+    return str(key)
+
+
+def _parse_nan_guard(cfg: Any) -> NanGuardMode:
+    raw = os.environ.get(NAN_GUARD_ENV)
+    if raw is None:
+        raw = getattr(cfg, "nan_guard", "error")
+    mode = str(raw).lower()
+    if mode not in _NAN_GUARD_MODES:
+        raise ValueError(
+            f"nan_guard must be one of {sorted(_NAN_GUARD_MODES)}, got {raw!r}"
+        )
+    return cast(NanGuardMode, mode)
+
+
+def _nonfinite_env_mask(
+    tensordict: TensorDictBase,
+) -> tuple[torch.Tensor, list[tuple[Any, torch.Tensor]], list[tuple[Any, torch.Tensor]]]:
+    """Return invalid env mask, floating leaves, and keys that had non-finite values."""
+    num_envs = tensordict.batch_size[0]
+    invalid = torch.zeros(num_envs, dtype=torch.bool, device=tensordict.device)
+    floating_leaves: list[tuple[Any, torch.Tensor]] = []
+    offender_keys: list[tuple[Any, torch.Tensor]] = []
+    for key, value in tensordict.items(include_nested=True, leaves_only=True):
+        if (
+            isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and value.ndim > 0
+            and value.shape[0] == num_envs
+        ):
+            floating_leaves.append((key, value))
+            bad = ~torch.isfinite(value).reshape(num_envs, -1).all(dim=1)
+            if bad.any():
+                offender_keys.append((key, bad))
+            invalid |= bad
+    return invalid, floating_leaves, offender_keys
+
+
+def _apply_nan_guard(
+    tensordict: TensorDictBase,
+    *,
+    mode: NanGuardMode,
+) -> torch.Tensor:
+    """Handle non-finite transition rows according to ``mode``."""
+    if mode == "off":
+        return torch.zeros(
+            tensordict.batch_size[0],
+            dtype=torch.bool,
+            device=tensordict.device,
+        )
+
+    invalid, floating_leaves, offender_keys = _nonfinite_env_mask(tensordict)
+    if not invalid.any():
+        return invalid
+
+    if mode == "error":
+        env_ids = invalid.nonzero(as_tuple=False).reshape(-1).tolist()
+        raise NonFiniteTransitionError(
+            env_ids=env_ids,
+            keys=[key for key, _ in offender_keys],
+        )
+
+    num_envs = tensordict.batch_size[0]
+    for key, value in floating_leaves:
+        row_mask = invalid.reshape(num_envs, *((1,) * (value.ndim - 1)))
+        tensordict.set(key, torch.where(row_mask, torch.zeros_like(value), value))
+    tensordict["terminated"][invalid] = True
+    tensordict["truncated"][invalid] = False
+    tensordict["done"][invalid] = True
+    tensordict["discount"][invalid] = 0.0
+    return invalid
+
+
+def parse_component_spec(name: str, cfg):
+    if cfg is None or not hasattr(cfg, "items"):
+        raise ValueError(f"Component '{name}' must be a mapping.")
+    kwargs = dict(cfg)
+    target = kwargs.pop("_target_", name)
+    return name, target, kwargs
+
+
+def _tensordict_to_composite(td: TensorDictBase) -> Composite:
+    """Build a :class:`Composite` spec matching a compact observation TensorDict."""
+    spec: dict = {}
+    for key, value in td.items():
+        if isinstance(value, TensorDictBase):
+            spec[key] = _tensordict_to_composite(value)
+        else:
+            spec[key] = Unbounded(value.shape, dtype=value.dtype, device=td.device)
+    return Composite(spec, shape=td.batch_size, device=td.device)
+
+
+class ObsGroup:
+    def __init__(
+        self,
+        name: str,
+        funcs: Dict[str, mdp.Observation],
+        max_delay: int = 0,
+    ):
+        self.name = name
+        self.funcs = funcs
+        self.max_delay = max_delay
+        self.timestamp = -1
+        self._keys = list(funcs.keys())
+        self._is_functional: bool | None = None
+
+    def _initialize(self, env: "_EnvBase"):
+        self.env = env
+        for func in self.funcs.values():
+            func._initialize(env)
+
+        flags = [bool(func.functional) for func in self.funcs.values()]
+        if any(flags) and not all(flags):
+            raise ValueError(
+                f"ObsGroup '{self.name}' mixes functional and dense terms; "
+                "use all-functional or all-dense within a group."
+            )
+        self._is_functional = bool(flags) and bool(flags[0])
+
+        shapes = OrderedDict()
+        if self._is_functional:
+            compact = OrderedDict()
+            for key, func in self.funcs.items():
+                term_td = TensorDict(
+                    {}, batch_size=[env.num_envs], device=self.env.device
+                )
+                func.fupdate(term_td)
+                compact[key] = term_td
+                shapes[key] = func.fcompute(term_td).shape
+            group_td = TensorDict(
+                compact, batch_size=[env.num_envs], device=self.env.device
+            )
+            spec = {self.name: _tensordict_to_composite(group_td)}
+        else:
+            outputs = OrderedDict(
+                (key, func.compute()) for key, func in self.funcs.items()
+            )
+            for key, tensor in outputs.items():
+                shapes[key] = tensor.shape
+            obs = torch.cat(list(outputs.values()), dim=-1)
+            spec = {self.name: Unbounded(obs.shape, dtype=obs.dtype)}
+
+        self._spec = Composite(spec, shape=[env.num_envs]).to(self.env.device)
+        self._shapes = shapes
+
+    def __getitem__(self, key: str) -> mdp.Observation:
+        return self.funcs[key]
+
+    def keys(self):
+        return self.funcs.keys()
+
+    @property
+    def spec(self):
+        return self._spec
+
+    @property
+    def shapes(self):
+        return self._shapes
+
+    @property
+    def split(self):
+        return [shape[-1] for shape in self._shapes.values()]
+
+    @property
+    def is_functional(self) -> bool:
+        if self._is_functional is None:
+            raise RuntimeError(f"ObsGroup '{self.name}' is not initialized")
+        return self._is_functional
+    
+    def update(self, tensordict: TensorDictBase) -> None:
+        for func in self.funcs.values():
+            func.update()
+
+    def startup(self) -> None:
+        for func in self.funcs.values():
+            func.startup()
+
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> None:
+        for func in self.funcs.values():
+            func.reset(env_ids, tensordict)
+
+    def compute(self, tensordict: TensorDictBase, timestamp: int) -> TensorDictBase:
+        if self._is_functional:
+            compact = OrderedDict()
+            for key, func in self.funcs.items():
+                term_td = TensorDict(
+                    {},
+                    batch_size=tensordict.batch_size,
+                    device=tensordict.device,
+                )
+                func.fupdate(term_td)
+                compact[key] = term_td
+            tensordict[self.name] = TensorDict(
+                compact,
+                batch_size=tensordict.batch_size,
+                device=tensordict.device,
+            )
+        else:
+            outputs = OrderedDict(
+                (key, func.compute()) for key, func in self.funcs.items()
+            )
+            tensordict[self.name] = torch.cat(list(outputs.values()), dim=-1)
+        return tensordict
+
+    def materialize(self, tensordict: TensorDictBase) -> torch.Tensor:
+        """Densify a functional group stored under ``self.name`` into a cat vector.
+
+        Idempotent: if the group entry is already a dense tensor, return it.
+
+        ``nan_to_num`` covers the post-reset zeroed compact buffer (first obs is
+        discarded by algos); zero quats would otherwise NaN in ``fcompute``.
+        """
+        value = tensordict[self.name]
+        if not self._is_functional or torch.is_tensor(value):
+            return value
+        parts = [
+            func.fcompute(value[key]) for key, func in self.funcs.items()
+        ]
+        return torch.nan_to_num(torch.cat(parts, dim=-1))
+
+    def symmetry_transform(self):
+        """Return the mirror transform for the concatenated observation group.
+
+        Each observation component defines a local
+        :class:`~active_adaptation.utils.symmetry.SymmetryTransform` matching
+        the tensor slice produced by that component's ``compute()`` /
+        densified ``fcompute()`` output. ``ObsGroup`` concatenates observations
+        in ``self.funcs`` order, so the full group transform is the
+        concatenation of the same per-component transforms in the same order.
+
+        This is used by symmetry augmentation/equivariance losses to mirror a
+        complete policy observation without each learner needing to know how the
+        observation was assembled. When adding a new observation term, implement
+        its ``symmetry_transform()`` with the same dimension, permutation, and
+        sign convention as its densified output tensor.
+
+        For functional groups the transform applies to the densified vector from
+        :meth:`materialize` (same layout as a dense group).
+        """
+        transforms = [
+            func.symmetry_transform().to(func.device) for func in self.funcs.values()
+        ]
+        return symmetry_utils.SymmetryTransform.cat(transforms)
+    
+    def relabel(self, tensordict: TensorDictBase) -> torch.Tensor | TensorDictBase:
+        """Rebuild this group from a stacked rollout.
+
+        Dense groups concatenate each term's ``relabel`` output, in
+        ``self.funcs`` order, matching :meth:`compute`. Functional groups
+        store each term's ``relabel`` result under the term name, matching
+        the compact buffer :meth:`compute` writes for ``fupdate``. A
+        functional term returns that compact :class:`TensorDict`.
+        """
+        flags = [bool(func.functional) for func in self.funcs.values()]
+        if any(flags) and not all(flags):
+            raise ValueError(
+                f"ObsGroup '{self.name}' mixes functional and dense terms; "
+                "use all-functional or all-dense within a group."
+            )
+        functional = bool(flags) and bool(flags[0])
+        if functional:
+            compact = OrderedDict(
+                (key, func.relabel(tensordict)) for key, func in self.funcs.items()
+            )
+            return TensorDict(
+                compact,
+                batch_size=tensordict.batch_size,
+                device=tensordict.device,
+            )
+        parts = [func.relabel(tensordict) for func in self.funcs.values()]
+        return torch.cat(parts, dim=-1)
+
+    @classmethod
+    def create_from(
+        cls,
+        group_name: str,
+        group_cfg: dict,
+        *,
+        make_component: Callable[[type[mdp.Observation], str, dict], mdp.Observation | None],
+        command: mdp.Command | None = None,
+    ) -> "ObsGroup":
+        funcs: OrderedDict[str, mdp.Observation] = OrderedDict()
+        for obs_name, obs_cfg in dict(group_cfg).items():
+            obs_name, cls_name, obs_kwargs = parse_component_spec(obs_name, obs_cfg)
+            obs = make_component(mdp.Observation, cls_name, obs_kwargs)
+            if not obs:
+                continue
+            if command is not None:
+                obs.command_manager = command
+            funcs[obs_name] = obs
+        return cls(group_name, funcs)
+
+
+class RewardGroup:
+    """Group of reward terms; per-term EMA logging lives on each :class:`~mdp.Reward`."""
+
+    def __init__(
+        self,
+        name: str,
+        funcs: OrderedDict[str, mdp.Reward],
+        enabled: bool = True,
+        compile: bool = False,
+    ):
+        self.name = name
+        self.funcs = funcs
+        self.enabled = enabled
+        self.compile = compile
+    
+    @property
+    def n_terms(self) -> int:
+        return len(self.funcs)
+
+    def _initialize(self, env: "_EnvBase"):
+        self.env = env
+        for func in self.funcs.values():
+            func._initialize(env)
+        if self.compile:
+            self.compute = torch.compile(self.compute, fullgraph=True)
+    
+    def __getitem__(self, key: str) -> mdp.Reward:
+        return self.funcs[key]
+
+    def update(self, tensordict: TensorDictBase) -> None:
+        for func in self.funcs.values():
+            func.update(tensordict)
+
+    def startup(self) -> None:
+        for func in self.funcs.values():
+            func.startup()
+
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> None:
+        for func in self.funcs.values():
+            func.reset(env_ids, tensordict)
+
+    def compute(self) -> torch.Tensor:
+        """Terms concatenated on the last dim, shape ``[N, n_terms]``."""
+        cols: list[torch.Tensor] = []
+        for key, func in self.funcs.items():
+            with ScopedTimer(f"{self.name}.{key}", sync=PROFILE_SYNC_TIMERS):
+                reward = func.compute()
+            self.env.stats[self.name, key].add_(reward)
+            cols.append(reward.reshape(self.env.num_envs, -1))
+        if not cols:
+            return torch.zeros(self.env.num_envs, 0, device=self.env.device)
+        return torch.cat(cols, dim=-1)
+
+    def relabel(self, tensordict: TensorDictBase) -> torch.Tensor:
+        """Relabeled terms concatenated on the last dim, shape ``[T, N, n_terms]``."""
+        time_steps, num_envs = tensordict.shape[:2]
+        cols: list[torch.Tensor] = []
+        for _name, func in self.funcs.items():
+            term = func.weight * func.relabel(tensordict)
+            cols.append(term.reshape(time_steps, num_envs, -1))
+        if not cols:
+            return torch.zeros(time_steps, num_envs, 0, device=tensordict.device)
+        return torch.cat(cols, dim=-1)
+
+    def get_ema_stats(self) -> Dict[str, float]:
+        """Flatten per-term EMA metrics (e.g. mean, optional var) for logging."""
+        result: Dict[str, float] = {}
+        for key, func in self.funcs.items():
+            mean, var = func.get_ema_stats()
+            result[key] = mean.item()
+            if var is not None:
+                result[f"{key}_var"] = var.item()
+        return result
+
+    @classmethod
+    def create_from(
+        cls,
+        group_name: str,
+        group_cfg: dict,
+        *,
+        make_component: Callable[[type[mdp.Reward], str, dict], mdp.Reward | None],
+        register_component: Callable[[mdp.MDPComponent], None] | None = None,
+    ) -> "RewardGroup":
+        print(f"Reward group: {group_name}")
+        funcs: OrderedDict[str, mdp.Reward] = OrderedDict()
+
+        group_cfg = dict(group_cfg)
+        enabled = group_cfg.pop("_enabled_", True)
+        compile = group_cfg.pop("_compile_", False)
+
+        for rew_name, rew_cfg in group_cfg.items():
+            rew_name, cls_name, rew_kwargs = parse_component_spec(rew_name, rew_cfg)
+            reward = make_component(mdp.Reward, cls_name, rew_kwargs)
+            if not reward:
+                continue
+            funcs[rew_name] = reward
+            if register_component is not None and isinstance(reward, mdp.MDPComponent):
+                register_component(reward)
+            print(f"\t{rew_name}: \t{reward.weight:.2f}")
+
+        return cls(group_name, funcs, enabled, compile)
+
+
+@dataclass
+class EnvConfig:
+    # common terms
+    num_envs: int
+    max_episode_length: int
+    
+    # simulation terms, maybe backend-specific
+    sim: Any
+    robot: Any
+    terrain: Any
+    sensors: Optional[Dict[str, Any]]
+    objects: Optional[Dict[str, Any]]
+
+    nan_guard: NanGuardMode = "error"
+    """How to handle non-finite transition rows: ``sanitize``, ``error``, or ``off``."""
+
+class _EnvBase(EnvBase, RegistryMixin):
+    # ``reset(td, set_state=True)`` may carry ``command_state`` for commands
+    # that implement ``command_state_spec``.
+    _supports_set_state = True
+
+    def __init__(self, cfg: EnvConfig, device: str, headless: bool = True):
+        super().__init__(
+            device=device,
+            batch_size=[cfg.num_envs],
+            run_type_checks=False,
+        )
+        self.backend = active_adaptation.get_backend()
+        self.cfg = cfg
+        self.headless = headless
+        self.nan_guard = _parse_nan_guard(cfg)
+
+        self._create_mdp_terms()
+
+        self.terrain_type = None
+        self.visual = None
+        self.setup_scene()
+        self.sim = cast(SimAdapter, self.sim)
+        self.scene = cast(SceneAdapter, self.scene)
+        self._setup_visual()
+        if self.terrain_type is None:
+            warnings.warn(
+                "Terrain type is not set. Please check if the scene is properly initialized."
+            )
+        self.step_dt = float(self.cfg.sim.step_dt)
+        self.physics_dt = float(self.sim.get_physics_dt())
+        self.decimation = int(self.step_dt / self.physics_dt)
+
+        self.max_episode_length = int(self.cfg.max_episode_length)
+
+        with torch.device(self.device):
+            self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
+            self.episode_id = torch.zeros(self.num_envs, dtype=torch.long)
+            self.episode_origin = torch.zeros(self.num_envs, 3)
+
+        self.episode_count = 0
+        self.current_iter = 0
+
+        self._sensor_render_enabled = False
+        self._last_gui_render_time = 0.0
+        self._initialize_mdp_terms()
+        self._build_tensor_specs()
+
+        self.timestamp: int = 0
+        self.stats: TensorDict = self.reward_spec["stats"].zero()
+        self.input_tensordict = None
+        self.extra = {}
+        self._nonfinite_rows_total = 0
+        self.command_manager.startup()
+        for adapt in self.behaviors.values():
+            adapt.startup()
+        for group in self.observation_groups.values():
+            group.startup()
+        for group in self.reward_groups.values():
+            group.startup()
+        for rand in self.randomizations.values():
+            rand.startup()
+        for term in self.termination_funcs.values():
+            term.startup()
+        for input_manager in self.input_managers.values():
+            input_manager.startup()
+        self._startup_done = True
+
+    @property
+    def max_episode_length(self) -> torch.Tensor:
+        return self._max_episode_length
+
+    @max_episode_length.setter
+    def max_episode_length(self, value: int | torch.Tensor):
+        if isinstance(value, int):
+            value = torch.full((self.num_envs, 1), value, device=self.device)
+        elif isinstance(value, torch.Tensor):
+            assert value.dtype == torch.long, "Max episode length must be an integer tensor"
+            assert value.shape == (self.num_envs, 1), "Max episode length must be a tensor of shape (num_envs, 1)"
+        else:
+            raise ValueError(f"Invalid type for max episode length: {type(value)}")
+        self._max_episode_length = value.to(self.device)
+
+    @property
+    def sensor_render_enabled(self) -> bool:
+        """When True, call :meth:`SimAdapter.render_sensors` each control step.
+
+        Native Kit / mjlab camera observations set this in ``_initialize``.
+        3DGS cameras (:class:`~active_adaptation.envs.mdp.observations.visual.gs_camera`)
+        call ``env.visual.render`` in ``compute`` instead (option A) and do **not**
+        need this flag.
+        """
+        return self._sensor_render_enabled
+
+    @sensor_render_enabled.setter
+    def sensor_render_enabled(self, value: bool):
+        self._sensor_render_enabled = bool(value)
+
+    @property
+    def render_enabled(self) -> bool:
+        """Deprecated alias for :attr:`sensor_render_enabled`."""
+        return self.sensor_render_enabled
+
+    @render_enabled.setter
+    def render_enabled(self, value: bool):
+        self.sensor_render_enabled = value
+
+    def _setup_visual(self) -> None:
+        """Optional photoreal world (3DGS + mesh composite). Collision on ``scene``."""
+        visual_cfg = self.cfg.get("visual", None)
+        if visual_cfg is None:
+            self.visual = None
+            return
+        from active_adaptation.envs.visual import make_visual_world
+
+        self.visual = make_visual_world(visual_cfg, device=self.device)
+        if self.visual is None:
+            return
+        # Eager load so missing PLY fails at env construction, not first obs.
+        self.visual.load()
+        # Body-local visuals for GS mesh composite (typically ``robot``).
+        attach = getattr(self.visual, "attach_scene_meshes", None)
+        if attach is not None:
+            attach(self.scene)
+
+    def _create_mdp_terms(self):
+        self._scene_components: list[mdp.MDPComponent] = []
+        self._callback_component_ids: set[int] = set()
+        self.behaviors: OrderedDict[str, Any] = OrderedDict()
+        # Pending (scene_key, behavior): scene_key None → robot (key = behavior.name);
+        # otherwise key = f"{scene_key}.{behavior.name}".
+        self._pending_behaviors: list[tuple[str | None, Any]] = []
+        self.randomizations: Mapping[str, mdp.Randomization] = OrderedDict()
+        self.observation_groups: Mapping[str, ObsGroup] = OrderedDict()
+        self.reward_groups: Mapping[str, RewardGroup] = OrderedDict()
+        self.input_managers: Mapping[str, mdp.Action] = OrderedDict()
+        self.termination_funcs: Mapping[str, mdp.Termination] = OrderedDict()
+
+        self._enabled_reward_groups = 0
+
+        # Remaining callback bags: pre|post_step|debug_draw for MDP terms /
+        # command, plus backend clear_debug. startup / reset / update and
+        # entity behaviors are explicit.
+        self._pre_step_callbacks = []
+        self._post_step_callbacks = []
+        self._debug_draw_callbacks = []
+
+        # MDP: command manager
+        command_cfg = dict(self.cfg.command)
+        class_name = command_cfg.pop("_target_", None)
+        command = self._make_component(mdp.Command, class_name, command_cfg)
+        if not command:
+            raise ValueError(f"Command class '{class_name}' not found")
+        self.command_manager: mdp.Command = command
+        if isinstance(command, mdp.MDPComponent):
+            self._scene_components.append(command)
+
+        # MDP: input managers
+        for input_name, input_cfg in dict(self.cfg.get("input", {})).items():
+            _, input_cls_name, input_kwargs = parse_component_spec(
+                input_name, input_cfg
+            )
+            input_manager = self._make_component(
+                mdp.Action, input_cls_name, input_kwargs
+            )
+            if not input_manager:
+                continue
+            self.input_managers[input_name] = input_manager
+            if isinstance(input_manager, mdp.MDPComponent):
+                self._scene_components.append(input_manager)
+
+        # MDP: randomizations
+        for rand_name, rand_cfg in self.cfg.get("randomization", {}).items():
+            rand_name, cls_name, rand_kwargs = parse_component_spec(rand_name, rand_cfg)
+            rand = self._make_component(mdp.Randomization, cls_name, rand_kwargs)
+            if not rand:
+                continue
+            self.randomizations[rand_name] = rand
+            if isinstance(rand, mdp.MDPComponent):
+                self._add_mdp_component(rand)
+
+        # MDP: observations
+        for group_name, group_cfg in self.cfg.observation.items():
+            funcs = OrderedDict()
+            for obs_name, obs_cfg in group_cfg.items():
+                obs_name, obs_cls_name, obs_kwargs = parse_component_spec(
+                    obs_name, obs_cfg
+                )
+                obs = self._make_component(mdp.Observation, obs_cls_name, obs_kwargs)
+                if not obs:
+                    continue
+                funcs[obs_name] = obs
+                if isinstance(obs, mdp.MDPComponent):
+                    self._add_mdp_component(obs)
+            self.observation_groups[group_name] = ObsGroup(group_name, funcs)
+
+        # MDP: rewards
+        reward_cfg = dict(self.cfg.reward)
+        self.mult_dt = reward_cfg.pop("_mult_dt_", None)
+        if self.mult_dt is not None:
+            raise ValueError("reward._mult_dt_ / env.mult_dt is removed. It is the policy's responsibility to properly scale rewards.")
+        for group_name, group_cfg in reward_cfg.items():
+            rg = RewardGroup.create_from(
+                group_name,
+                group_cfg,
+                make_component=self._make_component,
+                register_component=self._add_mdp_component,
+            )
+            self._enabled_reward_groups += int(rg.enabled)
+            self.reward_groups[group_name] = rg
+
+        # MDP: terminations
+        termination_cfg = dict(self.cfg.get("termination", {}))
+        for term_name, term_cfg in termination_cfg.items():
+            term_name, cls_name, term_kwargs = parse_component_spec(term_name, term_cfg)
+            term = self._make_component(mdp.Termination, cls_name, term_kwargs)
+            if not term:
+                continue
+            self.termination_funcs[term_name] = term
+            if isinstance(term, mdp.MDPComponent):
+                self._add_mdp_component(term)
+
+    def _bind_behaviors(
+        self,
+        behaviors: Sequence[Any] | Sequence[tuple[str | None, Any]],
+        *,
+        asset: Any | None = None,
+        key_prefix: str | None = None,
+    ) -> None:
+        """Initialize entity behaviors and register them on ``env.behaviors``.
+
+        Called from backend ``setup_scene`` after the bound entity exists.
+        Lifecycle methods are invoked explicitly from ``_EnvBase`` (not via
+        ``_XXX_callbacks``).
+
+        Args:
+            behaviors: Either a sequence of behavior instances, or a
+                sequence of ``(scene_key, behavior)`` pairs. ``scene_key is None``
+                (or omitted) means robot: registry key is ``behavior.name``.
+                Otherwise key is ``f"{scene_key}.{behavior.name}"``.
+            asset: Entity to bind. Defaults to ``self.robot`` when
+                ``key_prefix`` is None.
+            key_prefix: If given, forces keys ``f"{key_prefix}.{behavior.name}"``
+                for a flat behavior sequence (used when binding one object).
+        """
+        from active_adaptation.envs.behaviors.behavior import EntityBehavior
+
+        if not hasattr(self, "behaviors") or self.behaviors is None:
+            self.behaviors = OrderedDict()
+
+        bound_asset = asset if asset is not None else self.robot
+        if bound_asset is None:
+            raise RuntimeError("Cannot bind behaviors: no asset/robot available")
+
+        for item in behaviors:
+            if item is None:
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                scene_key, adapt = item
+            else:
+                scene_key, adapt = key_prefix, item
+            if adapt is None:
+                continue
+            if not isinstance(adapt, EntityBehavior):
+                warnings.warn(
+                    f"Entity behavior {type(adapt).__name__} does not subclass "
+                    f"EntityBehavior; prefer migrating it.",
+                    stacklevel=2,
+                )
+            adapt_name = getattr(adapt, "name", None) or type(adapt).__name__
+            name = f"{scene_key}.{adapt_name}" if scene_key else adapt_name
+            if name in self.behaviors:
+                raise ValueError(f"Duplicate entity behavior name {name!r}")
+            adapt._initialize(self, asset=bound_asset)
+            self.behaviors[name] = adapt
+
+    def _bind_pending_behaviors(self) -> None:
+        """Bind all ``_pending_behaviors`` using ``scene.entities`` by key.
+
+        Robot entries use ``scene_key=None`` → ``self.robot`` and bare
+        ``behavior.name``. Object entries use the YAML ``objects:`` key as
+        ``scene_key`` → ``f"{scene_key}.{behavior.name}"``.
+        """
+        pending = list(getattr(self, "_pending_behaviors", ()) or ())
+        self.behaviors = OrderedDict()
+        if not pending:
+            self._pending_behaviors = []
+            return
+
+        by_key: OrderedDict[str | None, list[Any]] = OrderedDict()
+        for item in pending:
+            if item is None:
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                scene_key, adapt = item
+            else:
+                scene_key, adapt = None, item
+            by_key.setdefault(scene_key, []).append(adapt)
+
+        for scene_key, adapts in by_key.items():
+            if scene_key is None:
+                asset = self.robot
+                prefix = None
+            else:
+                entities = getattr(self.scene, "entities", None)
+                if entities is None:
+                    raise RuntimeError(
+                        f"Cannot bind object behavior for {scene_key!r}: "
+                        "scene has no entities"
+                    )
+                if scene_key not in entities:
+                    raise KeyError(
+                        f"Cannot bind object behavior for {scene_key!r}: "
+                        f"not in scene.entities (have {list(entities)})"
+                    )
+                asset = entities[scene_key]
+                prefix = scene_key
+            self._bind_behaviors(adapts, asset=asset, key_prefix=prefix)
+
+        self._pending_behaviors = []
+
+    def get_behavior(self, name: str) -> Any | None:
+        return self.behaviors.get(name)
+
+    def require_behavior(self, name: str) -> Any:
+        behavior = self.behaviors.get(name)
+        if behavior is None:
+            raise KeyError(
+                f"Entity behavior {name!r} is not bound. "
+                f"Available: {list(self.behaviors)}"
+            )
+        return behavior
+
+    def _edit_scene_spec(self, scene_cfg: Any) -> None:
+        for component in self._scene_components:
+            component.edit_spec(scene_cfg)
+        # Behaviors are bound after entities exist; call edit_spec on
+        # pending (pre-bind) instances when backends stash them.
+        for item in getattr(self, "_pending_behaviors", ()) or ():
+            adapt = item[1] if isinstance(item, tuple) else item
+            edit = getattr(adapt, "edit_spec", None)
+            if callable(edit):
+                edit(scene_cfg)
+
+    def _initialize_mdp_terms(self):
+        self.command_manager._initialize(self)
+        self._register_command_component(self.command_manager)
+        for input_manager in self.input_managers.values():
+            input_manager._initialize(self)
+            self._add_mdp_component(input_manager)
+        for rand in self.randomizations.values():
+            rand._initialize(self)
+            self._add_mdp_component(rand)
+        for group in self.observation_groups.values():
+            group._initialize(self)
+            for obs in group.funcs.values():
+                self._add_mdp_component(obs)
+        for reward_group in self.reward_groups.values():
+            reward_group._initialize(self)
+            for reward in reward_group.funcs.values():
+                self._add_mdp_component(reward)
+        for term in self.termination_funcs.values():
+            term._initialize(self)
+            self._add_mdp_component(term)
+
+    def _make_component(
+        self,
+        base_cls: type[mdp.MDPComponent],
+        class_name: str,
+        kwargs: dict[str, Any],
+    ) -> mdp.MDPComponent | None:
+        if class_name not in base_cls.registry:
+            raise ValueError(f"Class '{class_name}' not found in {base_cls.__name__}.registry")
+        instance_cls = base_cls.registry[class_name]
+        backend = active_adaptation.get_backend()
+        if backend is not None and backend not in instance_cls.supported_backends:
+            warnings.warn(
+                f"Class '{class_name}' does not support backend '{backend}'. "
+                f"Supported backends: {instance_cls.supported_backends}"
+            )
+            return None
+        return instance_cls(**kwargs)
+
+    def _register_command_component(self, command: mdp.Command) -> None:
+        if mdp.is_method_implemented(command, mdp.MDPComponent, "pre_step"):
+            self._pre_step_callbacks.append(command.pre_step)
+        if mdp.is_method_implemented(command, mdp.MDPComponent, "post_step"):
+            self._post_step_callbacks.append(command.post_step)
+        if mdp.is_method_implemented(command, mdp.MDPComponent, "debug_draw"):
+            self._debug_draw_callbacks.append(command.debug_draw)
+
+    def _build_tensor_specs(self):
+        self.done_spec = Composite(
+            done=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
+            terminated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
+            truncated=Binary(1, [self.num_envs, 1], dtype=bool, device=self.device),
+            shape=[self.num_envs],
+            device=self.device,
+        )
+
+        action_spec = {
+            input_name: Unbounded(
+                [self.num_envs, input_manager.action_dim], device=self.device
+            )
+            for input_name, input_manager in self.input_managers.items()
+        }
+        self.action_spec = Composite(
+            action_spec, shape=[self.num_envs], device=self.device
+        )
+
+        observation_spec = {}
+        [
+            observation_spec.update(group.spec)
+            for group in self.observation_groups.values()
+        ]
+        self.observation_spec = Composite(
+            observation_spec, shape=[self.num_envs], device=self.device
+        )
+        self.observation_spec["episode_id"] = Unbounded(
+            [self.num_envs], dtype=torch.long, device=self.device
+        )
+
+        reward_spec = Composite({})
+
+        scalar = Unbounded(1, device=self.device)
+        for group_name, reward_group in self.reward_groups.items():
+            n_terms = len(reward_group.funcs)
+            if reward_group.enabled and n_terms:
+                reward_spec["reward", group_name] = Unbounded(n_terms, device=self.device)
+            for rew_name in reward_group.funcs.keys():
+                reward_spec["stats", group_name, rew_name] = scalar.clone()
+            reward_spec["stats", group_name, "return"] = scalar.clone()
+
+        for term_name in self.termination_funcs.keys():
+            reward_spec["stats", "termination", term_name] = scalar.clone()
+        reward_spec["stats", "termination", "command"] = scalar.clone()
+
+        reward_spec["discount"] = Unbounded(1, device=self.device)
+        reward_spec["stats", "success"] = scalar.clone()
+        reward_spec["stats", "episode_len"] = scalar.clone()
+        self.reward_spec = reward_spec.expand(self.num_envs).to(self.device)
+
+        shapes = self.command_manager.command_state_spec()
+        if shapes:
+            self.state_spec["command_state"] = Composite(
+                {
+                    key: Unbounded(
+                        [self.num_envs, *shape], device=self.device
+                    )
+                    for key, shape in shapes.items()
+                },
+                shape=[self.num_envs],
+                device=self.device,
+            )
+
+    def _add_mdp_component(self, component: mdp.MDPComponent):
+        if component not in self._scene_components:
+            self._scene_components.append(component)
+
+        component_id = id(component)
+        if component_id in self._callback_component_ids:
+            return
+        self._callback_component_ids.add(component_id)
+
+        if mdp.is_method_implemented(component, mdp.MDPComponent, "pre_step"):
+            self._pre_step_callbacks.append(component.pre_step)
+        if mdp.is_method_implemented(component, mdp.MDPComponent, "post_step"):
+            self._post_step_callbacks.append(component.post_step)
+        if mdp.is_method_implemented(component, mdp.MDPComponent, "debug_draw"):
+            self._debug_draw_callbacks.append(component.debug_draw)
+
+    def setup_scene(self):
+        raise NotImplementedError
+
+    # ---------------------------------------------------------------------
+    # Runtime helpers
+    # ---------------------------------------------------------------------
+    def set_progress(self, progress: int):
+        self.current_iter = progress
+
+    @staticmethod
+    def _callback_label(callback) -> str:
+        owner = getattr(callback, "__self__", None)
+        if owner is not None:
+            return owner.__class__.__name__
+        return getattr(callback, "__qualname__", getattr(callback, "__name__", "callback"))
+
+    @property
+    def num_envs(self) -> int:
+        return self.scene.num_envs
+
+    @property
+    def action_manager(self):
+        return self.input_managers["action"]
+
+    @property
+    def stats_ema(self) -> Dict[str, float]:
+        """Aggregate EMA stats from all reward groups."""
+        result = {}
+        for group_key, group in self.reward_groups.items():
+            for rew_key, value in group.get_ema_stats().items():
+                result[f"reward.{group_key}/{rew_key}"] = value
+        return result
+
+    @ScopedTimer("env._reset", sync=PROFILE_SYNC_TIMERS)
+    def _reset(
+        self, tensordict: TensorDictBase | None = None, **kwargs
+    ) -> TensorDictBase:
+        if tensordict is not None:
+            env_mask = tensordict.get("_reset").reshape(self.num_envs)
+            env_ids = env_mask.nonzero().squeeze(-1)
+        else:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            tensordict = TensorDict(
+                {}, batch_size=[self.num_envs], device=self.device
+            )
+
+        if len(env_ids):
+            num_envs = env_ids.numel()
+            self.episode_length_buf[env_ids] = 0
+            self.episode_id[env_ids] = self.episode_count + torch.arange(
+                num_envs, device=self.device
+            )
+            self.episode_count += num_envs
+
+            self.stats[env_ids] = 0.0
+            self.scene.reset(env_ids)
+            self.episode_origin[env_ids] = self.command_manager.reset(
+                env_ids, tensordict
+            )
+            for behavior in self.behaviors.values():
+                behavior.reset(env_ids, tensordict)
+            for group in self.observation_groups.values():
+                group.reset(env_ids, tensordict)
+            for group in self.reward_groups.values():
+                group.reset(env_ids, tensordict)
+            for rand in self.randomizations.values():
+                rand.reset(env_ids, tensordict)
+            for term in self.termination_funcs.values():
+                term.reset(env_ids, tensordict)
+            for input_manager in self.input_managers.values():
+                input_manager.reset(env_ids, tensordict)
+
+        tensordict = TensorDict({}, self.num_envs, device=self.device)
+        tensordict.update(self.observation_spec.zero())
+        tensordict.set("episode_id", self.episode_id.clone())
+        self._last_gui_render_time = time.perf_counter()
+        return tensordict
+
+    # TODO: add explanation for the difference
+    def _should_render_sensors(self, substep: int) -> bool:
+        if substep != self.decimation - 1:
+            return False
+        return self.sensor_render_enabled
+
+    def _should_render_gui(self, substep: int) -> bool:
+        if substep != self.decimation - 1:
+            return False
+        if not self.sim.has_gui():
+            return False
+        if time.perf_counter() - self._last_gui_render_time > 1.0 / 30.0:
+            self._last_gui_render_time = time.perf_counter()
+            return True
+        return False
+
+    def _should_debug_draw(self) -> bool:
+        return self.sim.has_gui()
+
+    @ScopedTimer("env._step", sync=PROFILE_SYNC_TIMERS)
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        with ScopedTimer("process_action", sync=PROFILE_SYNC_TIMERS):
+            self.command_manager.prescribe(tensordict)
+            for input_key, input_manager in self.input_managers.items():
+                input_manager.process_action(tensordict.get(input_key, None))
+        
+        with ScopedTimer("simulation", sync=PROFILE_SYNC_TIMERS):
+            for substep in range(self.decimation):
+                with ScopedTimer("simulation.pre_step", sync=PROFILE_SYNC_TIMERS):
+                    self.scene.zero_external_wrenches()
+                    for input_manager in self.input_managers.values():
+                        input_manager.apply_action(tensordict)
+                    for adapt in self.behaviors.values():
+                        adapt.pre_step(substep)
+                    [callback(substep) for callback in self._pre_step_callbacks]
+                    self.scene.write_data_to_sim()
+                with ScopedTimer("simulation.step", sync=PROFILE_SYNC_TIMERS):
+                    self.sim.step(
+                        render_sensors=self._should_render_sensors(substep),
+                        render_gui=self._should_render_gui(substep),
+                    )
+                with ScopedTimer("simulation.post_step", sync=PROFILE_SYNC_TIMERS):
+                    self.scene.update(self.physics_dt)
+                    for adapt in self.behaviors.values():
+                        adapt.post_step(substep)
+                    [callback(substep) for callback in self._post_step_callbacks]
+
+        self.episode_length_buf.add_(1)
+        self.timestamp += 1
+
+        tensordict = TensorDict({}, self.num_envs, device=self.device)
+
+        with ScopedTimer("command.update", sync=PROFILE_SYNC_TIMERS):
+            self.command_manager.update(tensordict)
+
+        with ScopedTimer("behavior.update", sync=PROFILE_SYNC_TIMERS):
+            for adapt in self.behaviors.values():
+                adapt.update(tensordict)
+        
+        # for input_manager in self.input_managers.values():
+        #     input_manager.update(tensordict)
+        
+        with ScopedTimer("reward.update", sync=PROFILE_SYNC_TIMERS):
+            for group in self.reward_groups.values():
+                group.update(tensordict)
+        tensordict = self._compute_reward(tensordict)
+        
+        with ScopedTimer("termination.update", sync=PROFILE_SYNC_TIMERS):
+            for termination_func in self.termination_funcs.values():
+                termination_func.update(tensordict)
+        tensordict = self._compute_termination(tensordict)
+
+        success = tensordict.get("success", None)
+        if success is None:
+            success = (self.episode_length_buf.reshape(self.num_envs, 1) >= self.max_episode_length * 0.9)
+        self.stats["episode_len"][:] = self.episode_length_buf.reshape(self.num_envs, 1)
+        self.stats["success"] = success.float().clone()
+        
+        with ScopedTimer("command.step", sync=PROFILE_SYNC_TIMERS):
+            self.command_manager.step()
+
+        with ScopedTimer("observation.update", sync=PROFILE_SYNC_TIMERS):
+            for group in self.observation_groups.values():
+                group.update(tensordict)
+        tensordict = self._compute_observation(tensordict)
+
+        with ScopedTimer("random.update", sync=PROFILE_SYNC_TIMERS):
+            for random_func in self.randomizations.values():
+                random_func.update()
+
+        tensordict.set("episode_id", self.episode_id.clone())
+        tensordict["stats"] = self.stats.clone()
+
+        invalid = _apply_nan_guard(tensordict, mode=self.nan_guard)
+        invalid_count = int(invalid.sum().item())
+        self._nonfinite_rows_total += invalid_count
+        self.extra["env/nonfinite_rows"] = invalid_count
+        self.extra["env/nonfinite_rows_total"] = self._nonfinite_rows_total
+
+        if self._should_debug_draw():
+            for adapt in self.behaviors.values():
+                adapt.debug_draw()
+            [callback() for callback in self._debug_draw_callbacks]
+
+        return tensordict
+
+    @ScopedTimer("reward.compute", sync=PROFILE_SYNC_TIMERS)
+    def _compute_reward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if not self.reward_groups:
+            tensordict.set("reward", torch.ones((self.num_envs, 1), device=self.device))
+            return tensordict
+
+        for group, reward_group in self.reward_groups.items():
+            reward = reward_group.compute()
+            if reward_group.enabled and reward.shape[-1] > 0:
+                self.stats[group, "return"].add_(reward.sum(dim=-1, keepdim=True))
+                tensordict["reward", group] = reward
+
+        return tensordict
+
+    @ScopedTimer("termination.compute", sync=PROFILE_SYNC_TIMERS)
+    def _compute_termination(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if (terminated := tensordict.get("terminated", None)) is None:
+            terminated = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        if (truncated := tensordict.get("truncated", None)) is None:
+            truncated = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        if (discount := tensordict.get("discount", None)) is None:
+            discount = torch.ones((self.num_envs, 1), device=self.device)
+        
+        terminated = terminated.reshape(self.num_envs, 1)
+        truncated = truncated.reshape(self.num_envs, 1)
+        discount = discount.reshape(self.num_envs, 1)
+
+        self.stats["termination", "command"] = terminated.float()
+        for key, func in self.termination_funcs.items():
+            result = func.compute(terminated)
+            if isinstance(result, tuple):
+                term_value, term_discount = result
+            else:
+                term_value, term_discount = result, 1.0
+            if not func.enabled:
+                term_value.zero_()
+            if func.is_timeout:
+                truncated |= term_value
+            else:
+                terminated |= term_value
+            discount *= term_discount
+            self.stats["termination", key] = term_value.float()
+        tensordict.set("truncated", truncated)
+        tensordict.set("terminated", terminated)
+        tensordict.set("done", terminated | truncated)
+        tensordict.set("discount", discount)
+        return tensordict
+
+    @ScopedTimer("observation.compute", sync=PROFILE_SYNC_TIMERS)
+    def _compute_observation(self, tensordict: TensorDictBase) -> TensorDictBase:
+        [
+            group.compute(tensordict, self.timestamp)
+            for group in self.observation_groups.values()
+        ]
+        return tensordict
+
+    @property
+    def ground(self):
+        if not hasattr(self, "_ground"):
+            self._ground = GroundQuery(
+                self.terrain_type, self.device, self.ground_mesh
+            )
+        return self._ground
+
+    @property
+    def ground_mesh(self):
+        """Warp ground mesh used for ray-based height queries.
+
+        The concrete mesh construction is delegated to the backend-specific
+        ``SceneAdapter`` implementations so that this environment stays
+        agnostic to how ground geometry is represented per backend.
+        """
+        return self.scene.ground_mesh
+
+    def get_ground_height_at(self, pos: torch.Tensor) -> torch.Tensor:
+        return self.ground.height_at(pos)
+
+    # ------------------------------------------------------------------
+    # Video recording
+    # ------------------------------------------------------------------
+    def get_recorder(self, path, enabled: bool = True) -> VideoRecorder:
+        """Return a backend-specific video recorder as a context manager.
+
+        Usage:
+            with env.get_recorder(\"video.mp4\", enabled) as rec:
+                ...
+                rec.add_frame()
+
+        For backends with ``rgb_array`` rendering support, this returns a
+        streaming recorder. Otherwise, or when ``enabled`` is False, this
+        returns a no-op recorder so call sites don't need to branch.
+        """
+        if not enabled:
+            return NullVideoRecorder()
+        if self.backend == "isaaclab":
+            return IsaacVideoRecorder(self, path, enabled=True)
+        if self.backend == "mjlab":
+            return RgbArrayVideoRecorder(self, path, enabled=True)
+        # Other backends: return a no-op recorder by default.
+        return NullVideoRecorder()
+
+    def _set_seed(self, seed: int = -1):
+        if self.backend == "isaaclab":
+            try:
+                import omni.replicator.core as rep
+
+                rep.set_global_seed(seed)
+            except ModuleNotFoundError:
+                pass
+            return torch_utils.set_seed(seed)
+        elif self.backend == "mujoco":
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        elif self.backend == "mjlab":
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        elif self.backend == "motrix":
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+
+    def render(self, mode: str = "human"):
+        if mode == "human":
+            return None
+        if mode == "rgb_array":
+            if hasattr(self, "_rgb_annotator"):
+                rgb_data = self._rgb_annotator.get_data()
+                rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(
+                    *rgb_data.shape
+                )
+                return rgb_data[:, :, :3]
+            if self.backend == "mjlab":
+                return self.sim.render_rgb_array()
+            raise NotImplementedError(
+                f"rgb_array mode not supported for backend '{self.backend}'. "
+                "Only Isaac and mjlab backends support rgb_array rendering."
+            )
+        raise NotImplementedError(f"Render mode '{mode}' not supported.")
+
+    def state_dict(self):
+        state_dict = super().state_dict()
+        state_dict["observation_spec"] = self.observation_spec
+        state_dict["action_spec"] = self.action_spec
+        state_dict["reward_spec"] = self.reward_spec
+        return state_dict
+
+    def diagnostics(self) -> dict:
+        d = dict(self.extra)
+        d.update(self.action_manager.diagnostics())
+        return d
+
+    def close(self, *, raise_if_closed: bool = True):
+        if not self.is_closed:
+            if self.backend == "isaaclab":
+                del self.scene
+                self.sim.clear_all_callbacks()
+                self.sim.clear_instance()
+            elif self.backend == "mjlab":
+                if self.sim.has_gui():
+                    self.sim.viewer.close()
+                self.sim.close()
+            elif self.backend == "motrix":
+                self.sim.close()
+            super().close(raise_if_closed=raise_if_closed)

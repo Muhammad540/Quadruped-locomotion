@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "active_adaptation"
+version = "0.8.1"
+authors = [
+    {name = "btx0424@SUSTech"}
+]
+keywords = ["robotics", "rl"]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "setproctitle",
+    "hydra-core",
+    "omegaconf",
+    "comet_ml",
+    "einops",
+    "termcolor",
+    "onnxruntime",
+    "onnxscript",
+    "jaxtyping",
+    "imageio",
+    "linuxfd",
+    "pdbpp",
+    "scipy",
+    "trimesh",
+    "matplotlib>=3.11.1",
+    "typer",
+    "simple-raycaster>=0.4.0,<0.5",
+    # Cooks robot bundles into ROBOT_MODEL_DIR (aa-cook-assets).
+    "assetx",
+]
+
+[project.optional-dependencies]
+swanlab = [
+    "swanlab",
+]
+# Install into the backend uv env you train with (Python differs per backend).
+# Trackio needs Python >=3.10; AA backends are 3.11 (isaac51) / 3.12 (isaac60) / >=3.11 (mjlab).
+trackio = [
+    "trackio",
+]
+render = [
+    "fvdb-core[viewer]==0.5.1+pt211.cu130",
+    # Robot mesh rasterization for GS composite (needs torch already installed).
+    "nvdiffrast",
+    "ninja",
+]
+
+[project.scripts]
+aa-project = "active_adaptation.cli:main"
+aa-discover-projects = "active_adaptation.cli:aa_discover_projects"
+aa-list-tasks = "active_adaptation.cli:aa_list_tasks"
+aa-cook-assets = "active_adaptation.assets.cooked:main"
+
+[project.entry-points."active_adaptation.projects"]
+facet = "projects.facet"
+mimic = "projects.mimic"
+metamorph = "projects.metamorph"
+
+[tool.setuptools.packages]
+find = { where = ["."], include = [
+    "active_adaptation*",
+    "scripts*",
+    "projects.facet*",
+    "projects.mimic*",
+    "projects.metamorph*"
+    ] }
+
+[tool.setuptools.package-data]
+"*" = ["**/*"]
+
+[tool.pyright]
+# typeCheckingMode = "strict"
+reportIncompatibleMethodOverride = "error"
+
+[[tool.uv.index]]
+name = "fvdb"
+url = "https://d36m13axqqhiit.cloudfront.net/simple"
+explicit = true
+
+[tool.uv]
+# nvdiffrast compiles CUDA extensions against the env's torch (official install).
+no-build-isolation-package = ["nvdiffrast"]
+# simple-raycaster and the render extra depend on torch. Each backend pins its
+# own build; the root tooling env must not resolve a wheel.
+exclude-dependencies = ["torch", "torchvision", "torchaudio"]
+
+[tool.uv.sources]
+fvdb-core = { index = "fvdb" }
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast", rev = "253ac4fcea7de5f396371124af597e6cc957bfae" }
+simple-raycaster = { git = "https://github.com/btx0424/simple-raycaster.git", rev = "a217433ea18bd1b897d6cd1137a228c517befa5c" }
+assetx = { git = "https://github.com/btx0424/assetx.git", branch = "main" }
